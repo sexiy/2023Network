@@ -1,0 +1,1086 @@
+#define _CRT_SECURE_NO_WARNINGS
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#pragma comment(lib,"ws2_32.lib")
+#pragma once
+#include "pcap.h"
+#include<iostream>
+#include<cstring>
+using namespace std;
+#define arptable_size 100;
+//由于仅构建一个路由表，所有采用全局变量，略微破坏类的封装性
+#pragma pack(1)//以1byte方式对齐
+typedef struct FrameHeader_t //帧首部
+{
+	BYTE DesMAC[6];//目的地址
+	BYTE SrcMAC[6];//源地址
+	WORD FrameType;//帧类型
+}FrameHeader_t;
+
+typedef struct ARPFrame_t //ARP数据包
+{
+	FrameHeader_t FrameHeader;
+	WORD HardwareType;
+	WORD ProtocolType;
+	BYTE HLen;
+	BYTE PLen;
+	WORD Operation;
+	BYTE SendHa[6]; //发送者的mac地址
+	DWORD SendIP;  //发送者的IP地址
+	BYTE RecvHa[6]; //目标mac地址
+	DWORD RecvIP;  //目标IP地址
+}ARPFrame_t;
+
+typedef struct IPHeader_t //IP首部
+{
+	BYTE Ver_HLen; //版本号 0100位IPv4
+	BYTE TOS; //服务类型
+	WORD TotalLen; //IP包总长度(首部和数据)
+	WORD ID; //标识符
+	WORD Flag_Segment; //分段序号
+	BYTE TTL; //生存时间  当IP包进行传送时，先会对该字段赋予某个特定的值。当IP包经过每一个沿途的路由器的时候，每个沿途的路由器会将IP包的TTL值减少1。如果TTL减少为0，则该IP包会被丢弃。这个字段可以防止由于故障而导致IP包在网络中不停被转发。 
+	BYTE Protocol;
+	WORD Checksum;
+	ULONG SrcIP; //IP包的源IP地址
+	ULONG DstIP; //IP包的目的IP地址
+}IPHeader_t;
+
+typedef struct IPFrame_t //IP数据包
+{
+	FrameHeader_t FrameHeader;
+	IPHeader_t IPHeader;
+}IPFrame_t;
+
+class RouteItem//路由表项
+{
+public:
+	int index;//索引
+	int type;//0为直接连接（不可删除），1为用户添加
+	RouteItem* next;
+	DWORD mask;//掩码
+	DWORD target_net;//目的网络
+	DWORD next_ip;//下一跳的IP地址
+	RouteItem();
+};
+
+class ARPTable
+{
+public:
+	DWORD ip; //IP与MAC地址——sendIP与sendHA
+	BYTE mac[6];
+	static int count;
+	static void insertARP(DWORD ip, BYTE mac[6]); //插入ARP表
+	static bool lookupARP(DWORD ip, BYTE mac[6]); //查询ARP表
+}my_arptable[100];
+
+
+class RouteTable
+{
+public:
+	int item_number;//项目条数
+	RouteItem* head;//路由表项
+	RouteItem* tail;
+	RouteTable();//初始化，添加直接连接的网络
+	void print();
+	void Insert(RouteItem* item);//添加路由表项，直接相连的在最前面，其余按最长匹配原则
+	void Insert1(RouteItem* item);
+	void Delete(int index);//删除第i条路由表项（直接相连的不可删除）
+
+	DWORD Search(DWORD ip);//根据最长匹配原则，查找下一跳的ip地址
+
+
+};
+#pragma pack()//恢复4bytes对齐
+
+
+class BufferPacket // 缓存的数据包
+{
+public:
+	BufferPacket();
+	BufferPacket* next;
+	int				len;          // 长度
+	BYTE			packetdata[1000];// 数据缓存
+	ULONG			TargetIP;     // 目的IP地址，就是下一跳步IP
+	//clock_t         starttime;            // 超时判断
+};
+
+class PacketList // 缓存的数据包
+{
+public:
+	int packet_num; //缓存条目
+	BufferPacket* head;//列表 头首末尾
+	BufferPacket* tail;
+	PacketList();
+	void Insert(BufferPacket* item);//添加新缓存数据包
+	void DeleteTimeout();//删除
+	void Ergodic(ARPFrame_t* ARPdata);//收到ARP数据报时，将与ARP中符合的数据包利用多线程发送
+};
+
+pcap_if_t* alldevs;//指向设备链表首部的指针
+pcap_if_t* d;
+pcap_addr_t* a;
+pcap_t* mydevice;//选择的网卡
+BYTE device_mac[6];
+char ip[10][20];
+char mask[10][20];
+PacketList BufferList;
+
+u_short checkerror(u_short* message, int size);
+//double MAX_TIME = 5000 * CLOCKS_PER_SEC;
+RouteItem::RouteItem() //路由表项初始化
+{
+	index = 0;
+	next = NULL;
+	mask = 0;
+	type = 0;
+	target_net = 0;
+	next_ip = 0;
+}
+#define _CRT_SECURE_NO_WARNINGS
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+RouteTable::RouteTable()//路由表初始化
+{
+	head = new RouteItem; //先创一个表头
+	tail = new RouteItem;
+	head->next = tail; //邓公列表，头首末尾
+	item_number = 0;
+	for (int i = 0; i < 2; i++) //路由表插入双网卡信息，
+	{
+		RouteItem* temp = new RouteItem;
+		temp->target_net = (inet_addr(ip[i])) & (inet_addr(mask[i])); //目标网络就是与运算一下
+		temp->mask = inet_addr(mask[i]);
+		temp->type = 0; //初始时是直接连接的，用户不得删除
+		this->Insert1(temp);
+	}
+}
+//借助DSA，无需考虑插入数据情况，仅考虑mask大小
+//头 data 尾
+//对尾节点仅判断，也依旧能插入，在边界状况是可以的，如果查找到最后一个，也是可以的
+void RouteTable::Insert1(RouteItem* item)
+{
+	item_number++;
+	RouteItem* temp = head;
+	//和tmp的next进行比较，比next大则插入到tmp和next之间
+	//temp从head开始 可以直接用while了，不用for
+	while (item->mask < temp->next->mask) { temp = temp->next; }
+	item->next = temp->next;
+	temp->next = item;
+	//出循环，表示item >= temp->next,
+	RouteItem* pointer = head->next;
+	for (int i = 0; pointer != NULL; i++)
+	{
+		pointer->index = i;
+		pointer = pointer->next;
+	}
+}
+void RouteTable::Insert(RouteItem* item)
+{
+	item_number++;
+	RouteItem* temp = head;
+
+	//第一个就插最前面
+	if (item_number == 0)
+	{
+		head->next = item;
+		item->next = NULL;
+	}
+	else
+	{
+		RouteItem* real_head = temp->next;
+		//假如比真正的第一个mask要大，也就是要把它插最头上
+		if (item->mask > real_head->mask)
+		{
+			item->next = real_head->next;
+			head->next = item;
+			RouteItem* pointer = head->next;
+			//重新编号
+			for (int i = 0; pointer != NULL; i++)
+			{
+				pointer->index = i;
+				pointer = pointer->next;
+			}
+			return;
+		}
+
+
+		temp = head->next;
+		while (temp != NULL)
+		{
+			//插中间，比前一个小比后一个大，插入二者中间
+			if (temp->next == NULL || (item->mask < temp->mask && item->mask >= temp->next->mask))
+				break;
+			temp = temp->next;
+		}
+		//到了尾了，说明插入表项的mask最大
+		if (temp->next == NULL)
+		{
+			item->next = NULL;
+			temp->next = item;
+		}
+		else //插到中间
+		{
+			item->next = temp->next;
+			temp->next = item;
+		}
+	}
+	RouteItem* pointer = head->next;
+
+	//重新编号
+	for (int i = 0; pointer != NULL; i++)
+	{
+		pointer->index = i;
+		pointer = pointer->next;
+	}
+	return;
+}
+
+//查找路由表，获取下一跳步的IP地址
+DWORD RouteTable::Search(DWORD ip)
+{
+	//从路由表头开时遍历，一直到尾
+	for (RouteItem* temp = head->next; temp != NULL; temp = temp->next)
+	{
+		//与子网掩码与运算，若结果和目的网络的IP相同
+		if ((temp->mask & ip) == temp->target_net)
+		{
+			if (temp->type == 0)  //假如下一跳步的所处网络直接就是相连网络，不需要跳步了直接传就完事了
+				return ip;
+			else
+				return temp->next_ip;
+		}
+	}
+	//return -1;
+}
+
+void RouteTable::print()
+{
+	//打印每一个表项
+	for (RouteItem* p = head->next; p != NULL; p = p->next)
+	{
+		in_addr addr;
+		cout << "索引为：";
+		cout << p->index << " ";
+
+		cout << "目标网络为：";
+		addr.s_addr = p->target_net;
+		char* print_str = inet_ntoa(addr);
+		cout << print_str << " ";
+
+		cout << "子网掩码为：";
+		addr.s_addr = p->mask;
+		print_str = inet_ntoa(addr);
+		cout << print_str << " ";
+
+		cout << "下一跳步为：";
+		addr.s_addr = p->next_ip;
+		print_str = inet_ntoa(addr);
+		cout << print_str << " ";
+
+		cout << "类型为：";
+		cout << p->type << endl;
+	}
+}
+
+void RouteTable::Delete(int index)
+{
+	if (index >= item_number)
+		cout << "路由表没有此表项！" << endl;
+	for (RouteItem* temp = head; temp->next != NULL; temp = temp->next)
+	{
+		if (temp->next->index == index)
+		{
+			if (temp->next->type == 0)
+			{
+				cout << "此项不得删除" << endl;
+				return;
+			}
+			else
+			{
+				temp->next = temp->next->next;
+				item_number--;
+				//重新编号
+				RouteItem* pointer = head->next;
+				for (int i = 0; pointer != NULL; i++)
+				{
+					pointer->index = i;
+					pointer = pointer->next;
+				}
+				return;
+			}
+		}
+	}
+}
+
+BufferPacket::BufferPacket()
+{
+	len = 0;
+	TargetIP = 0;
+	//starttime = 0;
+	next = NULL;
+}
+
+PacketList::PacketList()
+{
+	head = new BufferPacket;
+	tail = new BufferPacket;
+	head->next = tail;
+	packet_num = 0;
+}
+void PacketList::Insert(BufferPacket* item){
+	item->next=head->next;
+	head->next=item;
+	packet_num += 1;
+}
+/*
+void PacketList::Insert(BufferPacket* item)
+{
+	//初始项直接插到head后面
+	if (packet_num == 0)
+		head->next = item;
+	else
+	{
+		BufferPacket* temp = head->next;
+		//最后遍历结束的情形一定是temp->next为NULL
+		while (temp->next != NULL)
+		{
+			temp = temp->next;
+		}
+		temp->next = item;
+		item->next = NULL;
+	}
+	packet_num += 1;
+}
+*/
+//void PacketList::DeleteTimeout()//删除超时的缓存
+//{
+//	BufferPacket* temp = head->next;
+//	BufferPacket* pre = NULL;//前一个指针
+//	while (temp != NULL)
+//	{
+//		if (clock() - temp->starttime >= MAX_TIME)//逮到超时的
+//		{
+//			//假如要删除的节点是链表头
+//			if (temp == head->next)
+//			{
+//				head->next = temp->next;
+//				temp = temp->next;
+//				continue;
+//			}
+//			//删除链表中的一个节点
+//			else
+//			{
+//				pre->next = temp->next;
+//				temp = temp->next;
+//				continue;
+//			}
+//		}
+//		pre = temp;
+//		temp = temp->next;
+//	}
+//}
+
+
+//收到ARP数据报时，将与ARP中符合的数据包利用多线程发送
+//匹配模式为ip匹配，包含时序：ip->arp->ip，如果违反时序，多线程的操作可能不知道会咋样hhh
+void PacketList::Ergodic(ARPFrame_t* ARPdata)
+{
+	BufferPacket* temp = head->next;
+	BufferPacket* pre = NULL;
+	while (temp != NULL)
+	{
+		//匹配成功
+		if (temp->TargetIP == ARPdata->SendIP)
+		{
+			IPFrame_t* Resend = (IPFrame_t*)temp->packetdata;
+			for (int i = 0; i < 6; i++)
+			{
+				Resend->FrameHeader.DesMAC[i] = ARPdata->SendHa[i];
+				Resend->FrameHeader.SrcMAC[i] = device_mac[i];
+			}
+			pcap_sendpacket(mydevice, (u_char*)temp->packetdata, temp->len);//发包！
+			//my_diary.NotesIP(2, (IPFrame_t*)temp->packetdata);//日志记录转发
+			//发送完成后，由于使用类栈DSA，对此进行删除
+			if (temp == head->next)
+			{
+				head->next = temp->next;
+				temp = temp->next;
+				continue;
+			}
+			else
+			{
+				pre->next = temp->next;
+				temp = temp->next;
+				continue;
+			}
+		}
+		//匹配失败，向后迁移
+		pre = temp;
+		temp = temp->next;
+	}
+}
+
+void SendARP(DWORD target_ip)//获取目标ip对应的mac
+{
+	ARPFrame_t ARPFrame;
+	//广播地址
+	for (int i = 0; i < 6; i++)
+		ARPFrame.FrameHeader.DesMAC[i] = 0xff;
+	//SrcMAC是本机网卡的MAC地址
+	for (int i = 0; i < 6; i++)
+	{
+		ARPFrame.FrameHeader.SrcMAC[i] = device_mac[i];
+		ARPFrame.SendHa[i] = device_mac[i];
+	}
+	ARPFrame.FrameHeader.FrameType = htons(0x806);
+	ARPFrame.HardwareType = htons(0x0001);
+	ARPFrame.ProtocolType = htons(0x0800);
+	ARPFrame.HLen = 6;
+	ARPFrame.PLen = 4;
+	ARPFrame.Operation = htons(0x0001);
+	//将ARPFrame->SendIP设置为本机网卡上绑定的IP地址
+	ARPFrame.SendIP = inet_addr(ip[0]);
+
+	for (int i = 0; i < 6; i++)
+		ARPFrame.RecvHa[i] = 0;
+	ARPFrame.RecvIP = target_ip; //要获取的是目标IP的MAC
+
+	pcap_sendpacket(mydevice, (u_char*)&ARPFrame, sizeof(ARPFrame_t));
+	//在日志中打印发送方的IP与MAC，在本实验中就是路由器主机的IP与MAC
+	//my_diary.NotesARP(1, &ARPFrame);
+}
+
+
+
+void GetMyMAC(DWORD device_ip)	//获取网卡上的IP
+{
+	memset(device_mac, 0, sizeof(device_mac));
+	ARPFrame_t ARP_tomydev;
+	for (int i = 0; i < 6; i++)
+	{
+		ARP_tomydev.FrameHeader.DesMAC[i] = 0xff;
+		ARP_tomydev.FrameHeader.SrcMAC[i] = 0x0f;
+		ARP_tomydev.SendHa[i] = 0x66;
+		ARP_tomydev.RecvHa[i] = 0x00;
+	}
+	ARP_tomydev.FrameHeader.FrameType = htons(0x0806);//帧类型ARP
+	ARP_tomydev.HardwareType = htons(0x0001);//硬件类型以太网
+	ARP_tomydev.ProtocolType = htons(0x0800);//协议类型IP
+	ARP_tomydev.HLen = 6;//硬件地址长度为6
+	ARP_tomydev.PLen = 4;//协议地址长度为4
+	ARP_tomydev.Operation = htons(0x0001);//ARP请求
+	ARP_tomydev.SendIP = inet_addr("112.112.112.112");//sendip是本机网卡绑定的IP地址，按老师说的设个假IP
+	ARP_tomydev.RecvIP = device_ip; //使用函数参数的IP，也就是本机网卡的mac
+	struct pcap_pkthdr* pkt_header;
+	const u_char* pkt_data;
+	struct pcap_pkthdr* header = new pcap_pkthdr;
+	int k;
+
+	while (1)
+	{
+		//先开抓包
+		int capture = pcap_next_ex(mydevice, &pkt_header, &pkt_data);//抓包
+		//发送ARP
+		if (pcap_sendpacket(mydevice, (u_char*)&ARP_tomydev, sizeof(ARPFrame_t)) != 0)
+		{
+		}
+		if (capture == 1)
+		{
+			ARPFrame_t* ARP_response1 = (ARPFrame_t*)pkt_data;//转成定义好的数据结构，方便读取信息
+			//过滤条件：帧类型ARP，ARP响应，ARP响应的发送方IP是刚发送的主机的IP
+			if ((ntohs(ARP_response1->FrameHeader.FrameType) == 0x0806) && (ntohs(ARP_response1->Operation) == 0x0002) && (ARP_response1->SendIP == ARP_tomydev.RecvIP))
+			{
+				cout << "MAC地址为：";
+				for (int i = 0; i < 6; i++)
+				{
+					printf("%02X-", ARP_response1->FrameHeader.SrcMAC[i]);
+					device_mac[i] = ARP_response1->FrameHeader.SrcMAC[i];
+				}
+				cout << endl << endl;
+				break;
+			}
+		}
+	}
+}
+
+//路由器接收线程
+DWORD WINAPI RecvThread(LPVOID lparam)
+{
+	RouteTable table = *(RouteTable*)(LPVOID)lparam;//提取路由表
+	//数据包过滤
+	//https://blog.csdn.net/lhl_blog/article/details/8826429/
+	//捕获报文的过滤条件（ARP & IP）;
+	struct bpf_program fcode;
+	/*
+pt:会话句柄。
+fp:表示编译过的过滤规则存储的位置。
+str:字符串格式的过滤规则。
+optimize:表示过滤规则是否需要的优化(1:need,0:no)
+netmask:表示过滤应用的网络的子网掩码.
+	*/
+	if (pcap_compile(mydevice, &fcode, "ip or arp", 1, bpf_u_int32(mask[0])) < 0)
+	{
+		//return -1;
+	}
+	/*
+p:会话句柄。
+fp:表示编译过的过滤规则存储的位置。	
+	*/
+	//绑定过滤器
+	if (pcap_setfilter(mydevice, &fcode) < 0)
+	{
+		//return -1;
+	}
+
+	while (true)
+	{
+		//先抓包
+		pcap_pkthdr* pkt_header;
+		const u_char* pkt_data;
+		while (true)
+		{
+			int capture = pcap_next_ex(mydevice, &pkt_header, &pkt_data);
+			//捕获数据，(句柄、头、data)
+			if (capture)
+				break;
+		}
+		FrameHeader_t* frame_header = (FrameHeader_t*)pkt_data;
+		//限定mac地址为自己，即发向自己的数据包
+		int mac_me = 1;
+		for (int i = 0; i < 6; i++)
+		{
+			if (frame_header->DesMAC[i] != device_mac[i])
+				mac_me = 0;
+		}
+		if (mac_me)
+		{
+			if (ntohs(frame_header->FrameType) == 0x800) //解析帧头，如果是IP数据包
+			{
+				//提取出IP数据报，先去路由表里找下一跳步
+				IPFrame_t* IPdata = (IPFrame_t*)pkt_data;
+				//my_diary.NotesIP(1, IPdata); //记录日志：路由器接收到了IP数据包
+				DWORD target_ip = IPdata->IPHeader.DstIP; //先提取出数据包的目的IP地址
+				DWORD next_ip = table.Search(target_ip); //查找路由表下一跳步的IP地址
+				//当没有对应下一跳步时，函数返回-1
+				if (next_ip == -1)
+				{
+					continue;
+				}
+				
+				//packet.TargetIP = next_ip; //转发的下一个目标IP就是next_ip
+
+				//将数据包中的mac的地址改为自己的地址
+				for (int i = 0; i < 6; i++)
+				{
+					IPdata->FrameHeader.SrcMAC[i] = device_mac[i];
+				}
+				//TTL、校验和不管
+
+				//IPdata->IPHeader.Checksum = checkerror((u_short*)&(IPdata->IPHeader), sizeof(IPHeader_t));
+
+				//去ARP表查找下一跳步IP地址是否存在，若存在直接发送
+				if (my_arptable->lookupARP(next_ip, IPdata->FrameHeader.DesMAC))
+				{	
+					//发送
+					int send_res = pcap_sendpacket(mydevice, (const u_char*)pkt_data, pkt_header->len);
+					if (send_res == 0);
+						//my_diary.NotesIP(2, IPdata);//日志记录，转发数据包
+					cout << "目的:" << target_ip << " " << "下一跳:" << next_ip << " " << "mac:" << IPdata->FrameHeader.DesMAC<<endl;
+				}
+				//借助多线程，获得ARP地址，重新发送
+				else
+				{
+					BufferPacket IPPacket;
+					IPPacket.TargetIP = next_ip;
+					memcpy(IPPacket.packetdata, pkt_data, pkt_header->len);
+					IPPacket.len = pkt_header->len;
+					//IPPacket.starttime = clock();
+					BufferList.Insert(&IPPacket); //插入缓存数据包
+					//my_diary.NotesIP(3, IPdata);
+					SendARP(next_ip); //获取下一跳步的MAC
+				}
+			}
+
+			////解析帧头，如果是IP数据包
+			else if (ntohs(frame_header->FrameType) == 0x806)
+			{
+				ARPFrame_t* ARPdata = (ARPFrame_t*)pkt_data;
+				//my_diary.NotesARP(2, ARPdata);//日志记录接收ARP报文
+
+				//只接受响应报文，不去回复自己的arp，hardware may do it 
+				if (ARPdata->Operation == ntohs(0x0002))
+				{
+					//得先查看一下ARP表里是否有发送方的IP-MAC映射，没有就把映射插进ARP表里
+					if (my_arptable->lookupARP(ARPdata->SendIP, ARPdata->SendHa) == 0)
+					{
+						my_arptable->insertARP(ARPdata->SendIP, ARPdata->SendHa);
+					}
+					//接着转发缓存的数据包
+					//BufferList.DeleteTimeout();//先把超时的数据包删了
+					BufferList.Ergodic(ARPdata);//重新发送数据包
+				}
+			}
+		}
+	}
+}
+
+
+//void Diary::NotesIP(bool writetype, IPFrame_t* IPpacket)//ip类型
+//{
+//	if (writetype == 1)
+//		fprintf(fp, "接收IP数据包");
+//	else if (writetype == 2)
+//		fprintf(fp, "转发IP数据包");
+//	else if (writetype == 3)
+//		fprintf(fp, "缓存IP数据包");
+//
+//
+//
+//	in_addr addr;
+//
+//	//先打印源IP
+//	addr.s_addr = IPpacket->IPHeader.SrcIP;
+//	char* str = inet_ntoa(addr);
+//
+//	fprintf(fp, "源IP： ");
+//	fprintf(fp, "%s  ", str);
+//
+//	//再打印目的IP
+//	fprintf(fp, "目的IP： ");
+//	addr.s_addr = IPpacket->IPHeader.DstIP;
+//	str = inet_ntoa(addr);
+//	fprintf(fp, "%s  ", str);
+//
+//	//打印源MAC
+//	fprintf(fp, "源MAC： ");
+//	for (int i = 0; i < 5; i++)
+//		fprintf(fp, "%02X-", IPpacket->FrameHeader.SrcMAC[i]);
+//	fprintf(fp, "%02X  ", IPpacket->FrameHeader.SrcMAC[5]);
+//
+//	//打印目的MAC
+//	fprintf(fp, "目的MAC： ");
+//	for (int i = 0; i < 5; i++)
+//		fprintf(fp, "%02X-", IPpacket->FrameHeader.DesMAC[i]);
+//	fprintf(fp, "%02X\n", IPpacket->FrameHeader.DesMAC[5]);
+//}
+//
+//void Diary::NotesARP(bool writetype, ARPFrame_t* ARPpacket)//arp类型
+//{
+//	if (writetype == 1)
+//		fprintf(fp, "发送");
+//	else if (writetype == 2)
+//		fprintf(fp, "接收ARP数据包");
+//
+//	//打印发送方的IP
+//	in_addr addr;
+//	addr.s_addr = ARPpacket->SendIP;
+//	char* str = inet_ntoa(addr);
+//	fprintf(fp, "IP： ");
+//	fprintf(fp, "%s  ", str);
+//
+//	//打印发送方的MAC
+//	fprintf(fp, "MAC： ");
+//	for (int i = 0; i < 5; i++)
+//		fprintf(fp, "%02X-", ARPpacket->SendHa[i]);
+//	fprintf(fp, "%02X\n", ARPpacket->SendHa[5]);
+//
+//}
+
+
+u_short checkerror(u_short* message, int size)
+{
+	int count = (size + 1) / 2;
+	u_short* check_array = (u_short*)malloc(size + 1);
+	memset(check_array, 0, size + 1);
+	memcpy(check_array, message, size);
+	u_long sum = 0;
+	while (count--)
+	{
+		sum += *check_array;
+		check_array++;
+		if (sum & 0xffff0000)  //若进位
+		{
+			sum &= 0xffff; //保留后八位
+			sum++;  //加1
+		}
+	}
+	return ~(sum & 0xffff);
+}
+
+int ARPTable::count = 0;
+//插入ARP表
+void ARPTable::insertARP(DWORD new_ip, BYTE new_mac[6])
+{
+	my_arptable[count].ip = new_ip;
+	memcpy(my_arptable[count].mac, new_mac, 6);
+	count++;
+}
+
+//查询ARP表，查询到IP则返回1，同时给mac赋值；查询失败返回0
+bool ARPTable::lookupARP(DWORD search_ip, BYTE mac[6])
+{
+	memset(mac, 0, 6);
+	for (int i = 0; i < count; i++)
+	{
+		if (search_ip == my_arptable[i].ip)
+		{
+			memcpy(mac, my_arptable[i].mac, 6);
+			return 1;
+		}
+	}
+	return 0;
+}
+int main()
+{
+	//打印本地网卡的信息
+	char errbuf[PCAP_ERRBUF_SIZE];
+	if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, //获取本机的接口设备
+		NULL, //无需认证
+		&alldevs,//指向设备列表首部
+		errbuf//出错信息保存缓冲区
+	) == -1)
+	{
+		/*cout << "寄！获取设备失败！";*/
+		return 0;
+	}
+	int number = 0;
+	cout << "第一步：打开网卡获取网卡列表" << endl;
+	for (d = alldevs; d != NULL; d = d->next)  //简单输出网卡名称
+	{
+		number++;
+		cout << number << ". ";
+		cout << d->name << " ";
+		cout << d->description << " " << endl;
+		for (pcap_addr* a = d->addresses; a != nullptr; a = a->next)//再找其中有IP地址的网卡
+		{
+			if (((struct sockaddr_in*)a->addr)->sin_family == AF_INET && a->addr)//
+			{
+				cout << "IP地址：" << inet_ntoa(((struct sockaddr_in*)a->addr)->sin_addr) << endl;
+			}
+			/*if(((struct sockaddr_in*)a->netmask)->sin_family == AF_INET && a->netmask)
+				cout<<"子网掩码为："<< inet_ntoa(((struct sockaddr_in*)a->netmask)->sin_addr);*/
+
+
+		}
+		cout << endl;
+	}
+	cout << "第二步：选择单网卡双IP" << endl;
+	cout << endl << endl;
+
+	cout << "请选择一个网卡：";
+	int devices_id;
+	cin >> devices_id;
+
+	pcap_if_t* target_device;
+	target_device = alldevs;
+
+	for (int i = 0; i < devices_id - 1; i++)
+		target_device = target_device->next;
+
+
+	int little_num = 0;
+	d = target_device;
+	for (a = d->addresses; a != NULL; a = a->next)
+	{
+		if (a->addr->sa_family == AF_INET)
+		{
+			strcpy(ip[little_num], inet_ntoa(((struct sockaddr_in*)a->addr)->sin_addr));
+			strcpy(mask[little_num], inet_ntoa(((struct sockaddr_in*)a->netmask)->sin_addr));
+			little_num++;
+		}
+	}
+	mydevice = pcap_open(d->name, 100, PCAP_OPENFLAG_PROMISCUOUS, 1000, NULL, errbuf);
+	if (mydevice == NULL)
+	{
+		pcap_freealldevs(alldevs);
+	}
+	pcap_freealldevs(alldevs);
+
+	for (int i = 0; i < 2; i++)
+	{
+		cout << ip[i] << "     " << mask[i] << endl;
+	}
+	cout << "第三步：伪造ARP报文获取本机MAC" << endl;
+	GetMyMAC(inet_addr(ip[0]));
+
+
+	cout << "单网卡双IP——" << endl;
+
+
+	RouteTable mytable; //创建路由表，
+
+
+	CreateThread(NULL, 0, RecvThread, LPVOID(&mytable), 0, 0);
+	RouteItem a[50];
+	int a_number = 0;
+	int urchoose;//选择caption
+	//输入的时候注意网络为小端序，千万不能输入漏，否则将会导致不符合最长匹配原则
+	while (true)
+	{
+		mytable.print();
+		cout << "输入1插入路由表项，输入2删除路由表项" << endl;
+		cin >> urchoose;
+		switch (urchoose)
+		{
+		case 1:
+			cout << "当前路由表表项" << endl;
+			mytable.print();
+			if (a_number >= 50)
+			{
+				cout << "达到插入上限，无法插入" << endl;
+				break;
+			}
+			char input[30];
+			cout << "请输入目的网络：";
+			cin >> input;
+			a[a_number].target_net = inet_addr(input);
+
+			cout << "请输入子网掩码：";
+			cin >> input;
+			a[a_number].mask = inet_addr(input);
+
+			cout << "请输入下一跳步IP地址：";
+			cin >> input;
+			a[a_number].next_ip = inet_addr(input);
+
+			a[a_number].type = 1;
+
+			mytable.Insert1(&a[a_number]);
+			a_number++;
+			break;
+
+		case 2:
+			cout << "当前路由表表项" << endl;
+			mytable.print();
+			cout << "请输入要删除的表项。注意！类型为0的不可删除" << endl;
+			int deleteindex;
+			cin >> deleteindex;
+			mytable.Delete(deleteindex);
+			break;
+		default:
+			cout << "请扣1或2，别扣其他" << endl;
+			break;
+		}
+	}
+
+
+	return 0;
+}
+/*
+using namespace std;
+#pragma pack(1)
+typedef struct FrameHeader_t {//帧首部
+	BYTE DesMAC[6];//目的地址
+	BYTE SrcMAC[6];//源地址
+	WORD FrameType;//帧类型
+}FrameHeader_t;
+
+typedef struct ARPFrame_t {//IP首部
+	FrameHeader_t FrameHeader;
+	WORD HardwareType;
+	WORD ProtocolType;
+	BYTE HLen;
+	BYTE PLen;
+	WORD Operation;
+	BYTE SendHa[6];
+	DWORD SendIP;
+	BYTE RecvHa[6];
+	DWORD RecvIP;
+}ARPFrame_t;
+
+
+#pragma pack()
+
+
+
+pcap_if_t* alldevs;//指向设备链表首部的指针
+pcap_if_t* d;
+pcap_addr_t* a;
+
+
+int main()
+{	
+	//学弟的公网ip10.136.127.108
+	ARPFrame_t ARPFrame;
+	//将APRFrame.FrameHeader.DesMAC设置为广播地址
+	for (int i = 0; i < 6; i++)
+	ARPFrame.FrameHeader.DesMAC[i] = 0xff;
+	ARPFrame.FrameHeader.SrcMAC[0] = 0x78;
+	ARPFrame.FrameHeader.SrcMAC[1] = 0x2b;
+	ARPFrame.FrameHeader.SrcMAC[2] = 0x46;
+	ARPFrame.FrameHeader.SrcMAC[3] = 0x51;
+	ARPFrame.FrameHeader.SrcMAC[4] = 0x17;
+	ARPFrame.FrameHeader.SrcMAC[5] = 0x25;
+
+
+	ARPFrame.FrameHeader.FrameType = htons(0x806);//帧类型为ARP
+	ARPFrame.HardwareType = htons(0x0001);//硬件类型为以太网
+	ARPFrame.ProtocolType = htons(0x0800);//协议类型为IP
+	ARPFrame.HLen = 6;//硬件地址长度为6
+	ARPFrame.PLen = 4;//协议地址长为4
+	ARPFrame.Operation = htons(0x0001);//操作为ARP请求
+
+	for (int i = 0; i < 6; i++)
+		ARPFrame.SendHa[i] = 0x66;//设置MAC地址，这里用一个假MAC地址。
+
+	ARPFrame.SendIP = inet_addr("112.112.112.112");//sendip是本机网卡绑定的IP地址，按老师说的设个假IP
+
+	for (int i = 0; i < 6; i++)
+		ARPFrame.RecvHa[i] = 0;//RecvHa设置为0
+
+	char errbuf[PCAP_ERRBUF_SIZE];//函数得定义一个错误信息缓冲区
+	//获取设备列表
+	if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, //获取本机的接口设备
+		NULL, //无需认证
+		&alldevs,//指向设备列表首部
+		errbuf//出错信息保存缓冲区
+	) == -1)
+	{
+		cout << "获取设备失败";
+		return 0;
+	}
+	int number = 0;
+	for (d = alldevs; d != NULL; d = d->next)  //简单输出网卡名称
+	{
+		number++;
+		cout << number << " |";
+		cout << d->name << " |";
+		cout << d->description << " |";
+		for (pcap_addr* a = d->addresses; a != nullptr; a = a->next)//再找其中有IP地址的网卡
+		{
+			if (((struct sockaddr_in*)a->addr)->sin_family == AF_INET && a->addr)//
+			{
+				cout << "IP地址：" << inet_ntoa(((struct sockaddr_in*)a->addr)->sin_addr);
+			}
+		}
+		cout << endl;
+	}
+
+	cout << "请选择一个网卡：";
+	int devices_id;
+	cin >> devices_id;
+
+	pcap_if_t* target_device;
+	target_device = alldevs;
+
+	for (int i = 0; i < devices_id - 1; i++)
+		target_device = target_device->next;//列表遍历到该网卡处
+
+	char device_ip[INET_ADDRSTRLEN];
+	unsigned char device_mac[48];
+	if (target_device->addresses->addr->sa_family == AF_INET)//判断该地址是否为IP地址
+	{
+		strcpy(device_ip, inet_ntoa(((struct sockaddr_in*)target_device->addresses->addr)->sin_addr));  //直接用inet_ntop
+	}
+	cout << "所选设备的IP地址：" << device_ip << endl;
+
+	ARPFrame.RecvIP = inet_addr(device_ip);//ARPFrame.RecvIP设置为请求网卡的IP地址
+
+	pcap_t* p = pcap_open(target_device->name, 65536, PCAP_OPENFLAG_PROMISCUOUS, 100, NULL, errbuf);//打开网络接口
+
+
+	if (p == NULL)
+	{
+		cout << "本地模拟打开网络接口失败！" << endl;
+		pcap_freealldevs(alldevs);
+		return 0;
+	}
+
+	while (1)
+	{
+		//抓包
+		pcap_pkthdr* pkt_header;
+		const u_char* pkt_data;
+		int capture = pcap_next_ex(p, &pkt_header, &pkt_data);//抓包
+		//发送ARP
+		if (pcap_sendpacket(p, (u_char*)&ARPFrame, sizeof(ARPFrame_t)-1) != 0) {//该部分不止-1，更多的缺省也是可以的，能够得到ARP响应。
+			//cout << "本地模拟发送数据包失败！" << endl;
+			//pcap_freealldevs(alldevs);
+			//return 0;
+		}
+		if (capture == 1)
+		{
+			ARPFrame_t* ARP_response1 = (ARPFrame_t*)pkt_data;//转成定义好的数据结构，方便读取信息
+			//0806是ARP协议，0002是ARP响应，响应IP是请求IP
+			if ((ntohs(ARP_response1->FrameHeader.FrameType) == 0x0806) && (ntohs(ARP_response1->Operation) == 0x0002) && (ARP_response1->SendIP == ARPFrame.RecvIP))
+			{
+				cout << "所选设备的MAC地址为：";
+
+				for (int i = 0; i < 6; i++)
+				{
+					printf("%02x.", ARP_response1->FrameHeader.SrcMAC[i]);
+					device_mac[i] = ARP_response1->FrameHeader.SrcMAC[i];
+				}
+				break;
+			}
+		}
+	}
+	//下面用所选设备的mac构建新的arp包
+	cout << endl;
+	cout << "===============================================================================";
+	cout << endl;
+	cout << "开始针对局域网其他主机的IP、MAC捕获：" << endl;
+	cout << "请输入目标主机的IP地址：";
+	char target_ip[INET_ADDRSTRLEN];
+	cin >> target_ip;
+
+	ARPFrame_t ARPFrame_again;
+	ARPFrame_again.RecvIP = inet_addr(target_ip);
+	for (int i = 0; i < 6; i++) {
+		ARPFrame_again.FrameHeader.DesMAC[i] = 0xff;
+		ARPFrame_again.RecvHa[i] = 0x00;
+		ARPFrame_again.FrameHeader.SrcMAC[i] = device_mac[i];
+		ARPFrame_again.SendHa[i] = device_mac[i];
+	}
+	ARPFrame_again.FrameHeader.FrameType = htons(0x0806);
+	ARPFrame_again.HardwareType = htons(0x0001);
+	ARPFrame_again.ProtocolType = htons(0x0800);
+	ARPFrame_again.HLen = 6;
+	ARPFrame_again.PLen = 4;
+	ARPFrame_again.Operation = htons(0x0001);
+	ARPFrame_again.SendIP = inet_addr(device_ip);
+
+
+
+	while (1)
+	{
+		//先开抓包
+		pcap_pkthdr* pkt_header;
+		const u_char* pkt_data;
+		int capture = pcap_next_ex(p, &pkt_header, &pkt_data);//抓包
+		//发送ARP
+		if (pcap_sendpacket(p, (u_char*)&ARPFrame_again, sizeof(ARPFrame_t)) != 0) {
+			cout << "针对其他主机发送数据包失败！" << endl;
+			pcap_freealldevs(alldevs);
+			return 0;
+		}
+		if (capture == 1)
+		{
+			ARPFrame_t* ARP_response2 = (ARPFrame_t*)pkt_data;//转成定义好的数据结构，方便读取信息
+			if ((ntohs(ARP_response2->FrameHeader.FrameType) == 0x0806) && (ntohs(ARP_response2->Operation) == 0x0002) && (ARP_response2->SendIP == ARPFrame_again.RecvIP))
+			{
+				cout << "目标主机的MAC地址为：";
+
+				for (int i = 0; i < 6; i++)
+				{
+					printf("%02x.", ARP_response2->FrameHeader.SrcMAC[i]);
+				}
+				break;
+			}
+		}
+	}
+
+	pcap_freealldevs(alldevs);
+	return 0;
+
+}
+
+*/
+// 运行程序: Ctrl + F5 或调试 >“开始执行(不调试)”菜单
+// 调试程序: F5 或调试 >“开始调试”菜单
+
+// 入门使用技巧: 
+//   1. 使用解决方案资源管理器窗口添加/管理文件
+//   2. 使用团队资源管理器窗口连接到源代码管理
+//   3. 使用输出窗口查看生成输出和其他消息
+//   4. 使用错误列表窗口查看错误
+//   5. 转到“项目”>“添加新项”以创建新的代码文件，或转到“项目”>“添加现有项”以将现有代码文件添加到项目
+//   6. 将来，若要再次打开此项目，请转到“文件”>“打开”>“项目”并选择 .sln 文件
